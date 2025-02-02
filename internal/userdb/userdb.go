@@ -5,7 +5,7 @@
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -22,12 +22,12 @@ package userdb
 import (
 	"bytes"
 	"context"
-	// Embed the users.json.xz file into the binary.
-	_ "embed"
+	_ "embed" // Embed the users.json.xz file into the binary.
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,8 +40,6 @@ import (
 //go:embed userdb-date.txt
 var builtInDateStr string
 
-// https://www.radioid.net/static/users.json
-//
 //go:embed users.json.xz
 var compressedDMRUsersDB []byte
 
@@ -58,7 +56,49 @@ var (
 	ErrDecodingDB   = errors.New("error decoding DMR users database")
 )
 
-const waitTime = 100 * time.Millisecond
+const (
+	waitTime          = 100 * time.Millisecond
+	defaultUsersDBURL = "https://www.radioid.net/static/users.json"
+	updateTimeout     = 10 * time.Minute
+	envOverrideDBURL  = "OVERRIDE_USERS_DB_URL"
+)
+
+// ---- New additions for forced network check ----
+
+// forceUsersListCheck is set to true if the environment variable
+// FORCE_USERS_LIST_CHECK is defined/non-empty.
+var forceUsersListCheck = os.Getenv("FORCE_USERS_LIST_CHECK") != ""
+
+// networkCacheDuration is how long we rely on the last successful fetch
+// from the network before fetching again.
+const networkCacheDuration = 5 * time.Minute
+
+// lastNetworkCheckTime stores, atomically, the last time we successfully
+// fetched from the network.
+var lastNetworkCheckTime atomic.Int64 // store UnixNano
+
+func getLastNetworkCheck() time.Time {
+	nano := lastNetworkCheckTime.Load()
+	if nano == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nano)
+}
+
+func setLastNetworkCheck(t time.Time) {
+	lastNetworkCheckTime.Store(t.UnixNano())
+}
+
+// ------------------------------------------------
+
+// getUsersDBURL checks if an override is provided via environment
+// variable OVERRIDE_USERS_DB_URL. If not, returns the default URL.
+func getUsersDBURL() string {
+	if override := os.Getenv(envOverrideDBURL); override != "" {
+		return override
+	}
+	return defaultUsersDBURL
+}
 
 type UserDB struct {
 	uncompressedJSON   []byte
@@ -90,10 +130,7 @@ type DMRUser struct {
 
 func IsValidUserID(dmrID uint) bool {
 	// Check that the user id is 7 digits
-	if dmrID < 1000000 || dmrID > 9999999 {
-		return false
-	}
-	return true
+	return dmrID >= 1_000_000 && dmrID <= 9_999_999
 }
 
 func ValidUserCallsign(dmrID uint, callsign string) bool {
@@ -113,22 +150,51 @@ func ValidUserCallsign(dmrID uint, callsign string) bool {
 		return false
 	}
 
-	if !strings.EqualFold(user.Callsign, callsign) {
-		return false
-	}
-
-	return true
+	return strings.EqualFold(user.Callsign, callsign)
 }
 
 func (e *dmrUserDB) Unmarshal(b []byte) error {
-	err := json.Unmarshal(b, e)
-	if err != nil {
+	if err := json.Unmarshal(b, e); err != nil {
 		return ErrUnmarshal
 	}
 	return nil
 }
 
+// UnpackDB initializes or re-initializes the in-memory user database.
+//
+// If FORCE_USERS_LIST_CHECK is set, the built-in data is ignored completely,
+// and only the network-updated data is used, with a 5-minute cache in RAM.
 func UnpackDB() error {
+	// 1) If forced check is set, skip built-in data and rely on the network (cached for 5 minutes).
+	if forceUsersListCheck {
+		lastCheck := getLastNetworkCheck()
+		if time.Since(lastCheck) > networkCacheDuration {
+			logging.Log("FORCE_USERS_LIST_CHECK is set; updating from network only.")
+			if err := Update(); err != nil {
+				logging.Errorf("Forced network update failed: %v", err)
+				// No fallback to local data; we must rely on the network if forced.
+				return err
+			}
+			setLastNetworkCheck(time.Now())
+		}
+
+		// Mark userDB as "done" if not already done, so subsequent calls skip initialization.
+		if !userDB.isInited.Load() {
+			userDB.isInited.Store(true)
+		}
+		if !userDB.isDone.Load() {
+			userDB.isDone.Store(true)
+		}
+
+		// Ensure there's data
+		usrdb, ok := userDB.dmrUsers.Load().(dmrUserDB)
+		if !ok || len(usrdb.Users) == 0 {
+			return ErrNoUsers
+		}
+		return nil
+	}
+
+	// 2) Otherwise do the original embedded/built-in data unpack logic.
 	lastInit := userDB.isInited.Swap(true)
 	if !lastInit {
 		userDB.dmrUserMap = xsync.NewMapOf[uint, DMRUser]()
@@ -139,6 +205,7 @@ func UnpackDB() error {
 		if err != nil {
 			return ErrParsingDate
 		}
+
 		dbReader, err := xz.NewReader(bytes.NewReader(compressedDMRUsersDB))
 		if err != nil {
 			return ErrXZReader
@@ -147,21 +214,24 @@ func UnpackDB() error {
 		if err != nil {
 			return ErrReadDB
 		}
+
 		var tmpDB dmrUserDB
 		if err := json.Unmarshal(userDB.uncompressedJSON, &tmpDB); err != nil {
 			return ErrDecodingDB
 		}
 		tmpDB.Date = userDB.builtInDate
 		userDB.dmrUsers.Store(tmpDB)
+
+		// Load all into map
 		for i := range tmpDB.Users {
 			userDB.dmrUserMapUpdating.Store(tmpDB.Users[i].ID, tmpDB.Users[i])
 		}
-
 		userDB.dmrUserMap = userDB.dmrUserMapUpdating
 		userDB.dmrUserMapUpdating = xsync.NewMapOf[uint, DMRUser]()
 		userDB.isDone.Store(true)
 	}
 
+	// Wait if needed for any in-progress initialization
 	for !userDB.isDone.Load() {
 		time.Sleep(waitTime)
 	}
@@ -180,8 +250,7 @@ func UnpackDB() error {
 
 func Len() int {
 	if !userDB.isDone.Load() {
-		err := UnpackDB()
-		if err != nil {
+		if err := UnpackDB(); err != nil {
 			logging.Errorf("Error unpacking database: %v", err)
 			return 0
 		}
@@ -195,8 +264,7 @@ func Len() int {
 
 func Get(dmrID uint) (DMRUser, bool) {
 	if !userDB.isDone.Load() {
-		err := UnpackDB()
-		if err != nil {
+		if err := UnpackDB(); err != nil {
 			logging.Errorf("Error unpacking database: %v", err)
 			return DMRUser{}, false
 		}
@@ -208,18 +276,25 @@ func Get(dmrID uint) (DMRUser, bool) {
 	return user, true
 }
 
+// Update explicitly fetches the user data from the network.
+//
+// If FORCE_USERS_LIST_CHECK is set, UnpackDB() may call Update() automatically
+// every 5 minutes. Otherwise, you can call it manually when you wish to refresh.
 func Update() error {
 	if !userDB.isDone.Load() {
-		err := UnpackDB()
-		if err != nil {
+		if err := UnpackDB(); err != nil {
 			logging.Errorf("Error unpacking database: %v", err)
 			return ErrUpdateFailed
 		}
 	}
-	const updateTimeout = 10 * time.Minute
+
+	// Use helper to possibly override with env variable
+	url := getUsersDBURL()
+
 	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.radioid.net/static/users.json", nil)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return ErrUpdateFailed
 	}
@@ -228,6 +303,11 @@ func Update() error {
 	if err != nil {
 		return ErrUpdateFailed
 	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			logging.Errorf("Error closing response body: %v", cerr)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return ErrUpdateFailed
@@ -238,12 +318,7 @@ func Update() error {
 		logging.Errorf("ReadAll error %s", err)
 		return ErrUpdateFailed
 	}
-	defer func() {
-		err := resp.Body.Close()
-		if err != nil {
-			logging.Errorf("Error closing response body: %v", err)
-		}
-	}()
+
 	var tmpDB dmrUserDB
 	if err := json.Unmarshal(userDB.uncompressedJSON, &tmpDB); err != nil {
 		logging.Errorf("Error decoding DMR users database: %v", err)
@@ -266,21 +341,20 @@ func Update() error {
 	userDB.dmrUserMap = userDB.dmrUserMapUpdating
 	userDB.dmrUserMapUpdating = xsync.NewMapOf[uint, DMRUser]()
 
-	logging.Errorf("Update complete. Loaded %d DMR users", Len())
-
+	logging.Log("Update complete")
 	return nil
 }
 
 func GetDate() (time.Time, error) {
 	if !userDB.isDone.Load() {
-		err := UnpackDB()
-		if err != nil {
+		if err := UnpackDB(); err != nil {
 			return time.Time{}, err
 		}
 	}
 	db, ok := userDB.dmrUsers.Load().(dmrUserDB)
 	if !ok {
 		logging.Error("Error loading DMR users database")
+		return time.Time{}, ErrLoading
 	}
 	return db.Date, nil
 }
