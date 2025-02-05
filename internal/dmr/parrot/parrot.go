@@ -75,8 +75,6 @@ func (p *Parrot) RecordPacket(ctx context.Context, streamID uint, packet models.
 	packet.Repeater = repeaterID
 	packet.Src, packet.Dst = packet.Dst, packet.Src
 	packet.GroupCall = false
-	packet.BER = -1
-	packet.RSSI = -1
 
 	err = p.Redis.stream(ctx, streamID, packet)
 	if err != nil {

@@ -115,18 +115,27 @@ func UnpackPacket(data []byte) (Packet, bool) {
 	packet.DTypeOrVSeq = uint(bits & 0xF)                     //nolint:golint,gomnd
 	packet.StreamID = uint(data[16])<<24 | uint(data[17])<<16 | uint(data[18])<<8 | uint(data[19])
 	copy(packet.DMRData[:], data[20:53])
+
 	// Bytes 53-54 are BER and RSSI, respectively
 	// But they are optional, so don't error if they don't exist
+
+	// Rui Barreiros - 2024/12/12
+	// As per comment in Encode() these should be set (even if optional)
+	// so it doesn't break other (arguably) not well made software
+	// in hindsight, the data field could be changed to uint, but then we
+	// would need to change alot, exercise for future.
 	if len(data) > dmrconst.HBRPPacketLength {
 		packet.BER = int(data[dmrconst.HBRPPacketLength])
 	} else {
-		packet.BER = -1
+		packet.BER = 0
 	}
+	
 	if len(data) > dmrconst.HBRPPacketLength+1 {
 		packet.RSSI = int(data[dmrconst.HBRPPacketLength+1])
 	} else {
-		packet.RSSI = -1
+		packet.RSSI = 0
 	}
+	
 	return packet, true
 }
 
@@ -167,10 +176,21 @@ func (p *Packet) Encode() []byte {
 	data[18] = byte(p.StreamID >> 8)  //nolint:golint,gomnd
 	data[19] = byte(p.StreamID)
 	copy(data[20:53], p.DMRData[:])
-	// If BER and RSSI are set, add them
+
+	// Rui Barreiros - 2024/12/12
+	// From what I understand, most applications expect BER and RSSI
+	// and some (wrongly) do a packet size check, taking these 2 into
+	// account, therefore, it's better to always add them, at 0 if
+	// they are not set.
+	
+	// If BER and RSSI are set, add them else add and set them at 0
 	if p.BER != -1 && p.RSSI != -1 {
-		data = append(data, byte(p.BER))
-		data = append(data, byte(p.RSSI))
+		p.BER = 0
+		p.RSSI = 0
 	}
+
+	data = append(data, byte(p.BER))
+	data = append(data, byte(p.RSSI))
+
 	return data
 }

@@ -71,6 +71,7 @@ type Config struct {
 	AdminEmail               string
 	EnableEmail              bool
 	CanonicalHost            string
+	EnforceRadioid		 bool
 }
 
 var currentConfig atomic.Value //nolint:golint,gochecknoglobals
@@ -146,6 +147,7 @@ func loadConfig() Config {
 		AdminEmail:               os.Getenv("ADMIN_EMAIL"),
 		EnableEmail:              os.Getenv("ENABLE_EMAIL") != "",
 		CanonicalHost:            os.Getenv("CANONICAL_HOST"),
+		EnforceRadioid:		  os.Getenv("ENFORCE_RADIOID") != "0",
 	}
 	if tmpConfig.RedisHost == "" {
 		tmpConfig.RedisHost = "localhost:6379"
