@@ -43,7 +43,7 @@
     "cypress-wait-for-stable-dom": "^0.1.0",
     "eslint": "^8.57.1",
     "eslint-config-google": "^0.14.0",
-    "eslint-plugin-cypress": "^3.6.0",
+    "eslint-plugin-cypress": "^4.1.0",
     "eslint-plugin-vue": "^9.32.0",
     "mocha-junit-reporter": "^2.2.1",
     "mochawesome": "^7.1.3",
