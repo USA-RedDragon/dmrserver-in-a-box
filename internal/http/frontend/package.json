@@ -41,7 +41,7 @@
     "cypress-mochawesome-reporter": "^3.8.2",
     "cypress-multi-reporters": "^2.0.5",
     "cypress-wait-for-stable-dom": "^0.1.0",
-    "eslint": "^8.57.1",
+    "eslint": "^9.20.1",
     "eslint-config-google": "^0.14.0",
     "eslint-plugin-cypress": "^3.6.0",
     "eslint-plugin-vue": "^9.32.0",
